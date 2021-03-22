@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/araddon/dateparse"
 	restfulspec "github.com/emicklei/go-restful-openapi/v2"
 	"github.com/emicklei/go-restful/v3"
 	log "github.com/sirupsen/logrus"
@@ -198,7 +197,7 @@ func (s *Server) CreateWebService() *restful.WebService {
 		Doc("Insert an item.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
 		Param(ws.HeaderParameter("X-API-Key", "secret key for RESTful API")).
-		Reads(Item{}))
+		Reads(data.Item{}))
 	// Get items
 	ws.Route(ws.GET("/items").To(s.getItems).
 		Doc("Get items.").
@@ -219,7 +218,7 @@ func (s *Server) CreateWebService() *restful.WebService {
 		Doc("Insert items.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
 		Param(ws.HeaderParameter("X-API-Key", "secret key for RESTful API")).
-		Reads([]Item{}))
+		Reads([]data.Item{}))
 	// Delete item
 	ws.Route(ws.DELETE("/item/{item-id}").To(s.deleteItem).
 		Doc("Delete a item.").
@@ -230,13 +229,13 @@ func (s *Server) CreateWebService() *restful.WebService {
 
 	// Insert feedback
 	ws.Route(ws.POST("/feedback").To(s.insertFeedback).
-		Doc("Insert feedback.").
+		Doc("Insert multiple feedback.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
 		Param(ws.HeaderParameter("X-API-Key", "secret key for RESTful API")).
-		Reads(data.Feedback{}))
+		Reads([]data.Feedback{}))
 	// Get feedback
 	ws.Route(ws.GET("/feedback").To(s.getFeedback).
-		Doc("Get feedback.").
+		Doc("Get multiple feedback.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
 		Param(ws.HeaderParameter("X-API-Key", "secret key for RESTful API")).
 		Writes(FeedbackIterator{}))
@@ -313,7 +312,8 @@ func (s *Server) CreateWebService() *restful.WebService {
 		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
 		Param(ws.HeaderParameter("X-API-Key", "secret key for RESTful API")).
 		Param(ws.PathParameter("user-id", "identifier of the user").DataType("string")).
-		Param(ws.FormParameter("n", "the number of neighbors").DataType("int")))
+		Param(ws.QueryParameter("write-back", "write recommendation back to feedback").DataType("string")).
+		Param(ws.QueryParameter("n", "the number of neighbors").DataType("int")))
 
 	return ws
 }
@@ -336,7 +336,7 @@ func (s *Server) getPopular(request *restful.Request, response *restful.Response
 	}
 	var n, offset int
 	var err error
-	if n, err = parseInt(request, "n", 10); err != nil {
+	if n, err = parseInt(request, "n", s.Config.Server.DefaultN); err != nil {
 		badRequest(response, err)
 		return
 	}
@@ -361,7 +361,7 @@ func (s *Server) getLatest(request *restful.Request, response *restful.Response)
 	}
 	var n, offset int
 	var err error
-	if n, err = parseInt(request, "n", 10); err != nil {
+	if n, err = parseInt(request, "n", s.Config.Server.DefaultN); err != nil {
 		badRequest(response, err)
 		return
 	}
@@ -421,7 +421,7 @@ func (s *Server) getNeighbors(request *restful.Request, response *restful.Respon
 	// Get the number and offset
 	var n, offset int
 	var err error
-	if n, err = parseInt(request, "n", 10); err != nil {
+	if n, err = parseInt(request, "n", s.Config.Server.DefaultN); err != nil {
 		badRequest(response, err)
 		return
 	}
@@ -450,7 +450,7 @@ func (s *Server) getRecommendCache(request *restful.Request, response *restful.R
 	// Get the number and offset
 	var n, offset int
 	var err error
-	if n, err = parseInt(request, "n", 10); err != nil {
+	if n, err = parseInt(request, "n", s.Config.Server.DefaultN); err != nil {
 		badRequest(response, err)
 		return
 	}
@@ -475,11 +475,44 @@ func (s *Server) getRecommend(request *restful.Request, response *restful.Respon
 	}
 	start := time.Now()
 	userId := request.PathParameter("user-id")
-	n, err := parseInt(request, "n", 0)
+	n, err := parseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
 		badRequest(response, err)
 		return
 	}
+	writeBackFeedback := request.QueryParameter("write-back")
+	candidateCollections := make(chan []string, 3)
+	errors := make([]error, 3)
+	// load populars
+	go func() {
+		popularItems, err := s.CacheStore.GetList(cache.PopularItems, "", s.Config.Popular.NumPopular, 0)
+		if err != nil {
+			errors[0] = err
+			candidateCollections <- nil
+		} else {
+			candidateCollections <- popularItems
+		}
+	}()
+	// load latest
+	go func() {
+		latestItems, err := s.CacheStore.GetList(cache.LatestItems, "", s.Config.Latest.NumLatest, 0)
+		if err != nil {
+			errors[1] = err
+			candidateCollections <- nil
+		} else {
+			candidateCollections <- latestItems
+		}
+	}()
+	// load matched
+	go func() {
+		matchedItems, err := s.CacheStore.GetList(cache.MatchedItems, userId, s.Config.CF.NumCF, 0)
+		if err != nil {
+			errors[2] = err
+			candidateCollections <- nil
+		} else {
+			candidateCollections <- matchedItems
+		}
+	}()
 	// load feedback
 	userFeedback, err := s.DataStore.GetUserFeedback("", userId)
 	if err != nil {
@@ -490,51 +523,33 @@ func (s *Server) getRecommend(request *restful.Request, response *restful.Respon
 	for _, feedback := range userFeedback {
 		excludeSet.Add(feedback.ItemId)
 	}
-	// load popular
+	// merge collections
 	candidateItems := make([]string, 0)
-	popularItems, err := s.CacheStore.GetList(cache.PopularItems, "", s.Config.Popular.NumPopular, 0)
-	if err != nil {
-		internalServerError(response, err)
-		return
-	}
-	for _, itemId := range popularItems {
-		if !excludeSet.Contain(itemId) {
-			candidateItems = append(candidateItems, itemId)
-			excludeSet.Add(itemId)
+	for i := 0; i < 3; i++ {
+		items := <-candidateCollections
+		for _, itemId := range items {
+			if !excludeSet.Contain(itemId) {
+				candidateItems = append(candidateItems, itemId)
+				excludeSet.Add(itemId)
+			}
 		}
 	}
-	// load latest
-	latestItems, err := s.CacheStore.GetList(cache.LatestItems, "", s.Config.Latest.NumLatest, 0)
-	if err != nil {
-		internalServerError(response, err)
-		return
-	}
-	for _, itemId := range latestItems {
-		if !excludeSet.Contain(itemId) {
-			candidateItems = append(candidateItems, itemId)
-			excludeSet.Add(itemId)
-		}
-	}
-	// load matched
-	matchedItems, err := s.CacheStore.GetList(cache.MatchedItems, userId, s.Config.CF.NumCF, 0)
-	if err != nil {
-		internalServerError(response, err)
-		return
-	}
-	for _, itemId := range matchedItems {
-		if !excludeSet.Contain(itemId) {
-			candidateItems = append(candidateItems, itemId)
-			excludeSet.Add(itemId)
+	for i := 0; i < 3; i++ {
+		if errors[i] != nil {
+			internalServerError(response, errors[i])
+			return
 		}
 	}
 	log.Infof("server: recommend from (#candidate = %v)", len(candidateItems))
 	// collect item features
 	candidateFeaturedItems := make([]data.Item, len(candidateItems))
-	for i, itemId := range candidateItems {
-		candidateFeaturedItems[i], err = s.DataStore.GetItem(itemId)
-		if err != nil {
-			internalServerError(response, err)
-		}
+	err = base.Parallel(len(candidateItems), 4, func(_, jobId int) error {
+		candidateFeaturedItems[jobId], err = s.DataStore.GetItem(candidateItems[jobId])
+		return err
+	})
+	if err != nil {
+		internalServerError(response, err)
+		return
 	}
 	// online predict
 	recItems := base.NewTopKStringFilter(n)
@@ -547,13 +562,24 @@ func (s *Server) getRecommend(request *restful.Request, response *restful.Respon
 	result, _ := recItems.PopAll()
 	spent := time.Since(start)
 	log.Infof("server: complete recommendation (time = %v)", spent)
+	// write back
+	if writeBackFeedback != "" {
+		for _, itemId := range result {
+			err = s.DataStore.InsertFeedback(data.Feedback{
+				FeedbackKey: data.FeedbackKey{
+					UserId:       userId,
+					ItemId:       itemId,
+					FeedbackType: writeBackFeedback,
+				},
+				Timestamp: time.Now(),
+			}, false, false)
+			if err != nil {
+				internalServerError(response, err)
+				return
+			}
+		}
+	}
 	ok(response, result)
-}
-
-type Item struct {
-	ItemId    string
-	Timestamp string
-	Labels    []string
 }
 
 type Success struct {
@@ -628,7 +654,7 @@ func (s *Server) getUsers(request *restful.Request, response *restful.Response) 
 		return
 	}
 	cursor := request.QueryParameter("cursor")
-	n, err := parseInt(request, "n", 0)
+	n, err := parseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
 		badRequest(response, err)
 		return
@@ -695,32 +721,15 @@ func (s *Server) insertItems(request *restful.Request, response *restful.Respons
 		return
 	}
 	// Add ratings
-	temp := new([]Item)
-	if err := request.ReadEntity(temp); err != nil {
+	items := make([]data.Item, 0)
+	if err := request.ReadEntity(&items); err != nil {
 		badRequest(response, err)
 		return
 	}
-	// Parse timestamp
-	var err error
-	items := make([]data.Item, len(*temp))
-	for i, v := range *temp {
-		items[i].ItemId = v.ItemId
-		items[i].Timestamp, err = dateparse.ParseAny(v.Timestamp)
-		items[i].Labels = v.Labels
-		if err != nil {
-			badRequest(response, err)
-		}
-	}
-	// Get status before change
-	if err != nil {
-		internalServerError(response, err)
-		return
-	}
-
 	// Insert items
 	var count int
 	for _, item := range items {
-		err = s.DataStore.InsertItem(data.Item{ItemId: item.ItemId, Timestamp: item.Timestamp, Labels: item.Labels})
+		err := s.DataStore.InsertItem(data.Item{ItemId: item.ItemId, Timestamp: item.Timestamp, Labels: item.Labels})
 		count++
 		if err != nil {
 			internalServerError(response, err)
@@ -729,17 +738,19 @@ func (s *Server) insertItems(request *restful.Request, response *restful.Respons
 	}
 	ok(response, Success{RowAffected: count})
 }
+
 func (s *Server) insertItem(request *restful.Request, response *restful.Response) {
 	// Authorize
 	if !s.auth(request, response) {
 		return
 	}
-	temp := new(data.Item)
-	if err := request.ReadEntity(temp); err != nil {
+	item := new(data.Item)
+	var err error
+	if err = request.ReadEntity(item); err != nil {
 		badRequest(response, err)
 		return
 	}
-	if err := s.DataStore.InsertItem(*temp); err != nil {
+	if err = s.DataStore.InsertItem(*item); err != nil {
 		internalServerError(response, err)
 		return
 	}
@@ -757,7 +768,7 @@ func (s *Server) getItems(request *restful.Request, response *restful.Response) 
 		return
 	}
 	cursor := request.QueryParameter("cursor")
-	n, err := parseInt(request, "n", 0)
+	n, err := parseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
 		badRequest(response, err)
 		return
@@ -841,7 +852,7 @@ func (s *Server) getFeedback(request *restful.Request, response *restful.Respons
 	// Parse parameters
 	feedbackType := request.QueryParameter("feedback-type")
 	cursor := request.QueryParameter("cursor")
-	n, err := parseInt(request, "n", 0)
+	n, err := parseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
 		badRequest(response, err)
 		return
